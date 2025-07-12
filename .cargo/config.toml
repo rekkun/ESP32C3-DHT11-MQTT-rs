@@ -1,0 +1,27 @@
+[target.riscv32imc-unknown-none-elf]
+runner = "espflash flash --monitor --chip esp32c3 --log-format defmt"
+
+[env]
+DEFMT_LOG="info"
+SSID="P601"
+PASSWORD="00000000"  # Updated password
+HOSTNAME="ESP32C3-Rust"
+MQTT_CLIENT_ID="ESP32C3-Rust"
+MQTT_BROKER="137.66.59.140"
+MQTT_PORT="1883"
+MQTT_TOPIC="event"
+MQTT_USERNAME=""
+MQTT_PASSWORD=""
+
+[build]
+rustflags = [
+  # Required to obtain backtraces (e.g. when using the "esp-backtrace" crate.)
+  # NOTE: May negatively impact performance of produced code
+  "-C", "force-frame-pointers",
+  "-Z", "stack-protector=all",
+]
+
+target = "riscv32imc-unknown-none-elf"
+
+[unstable]
+build-std = ["alloc", "core"]
