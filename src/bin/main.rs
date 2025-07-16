@@ -27,7 +27,7 @@ use core::{
 
 use alloc::format;
 use bt_hci::{cmd::info, controller::ExternalController, event::le, uuid::appearance::sensor};
-use defmt::info;
+use defmt::{info, warn};
 use embassy_executor::Spawner;
 use embassy_net::{
     tcp::{self, TcpSocket},
@@ -38,10 +38,7 @@ use embassy_time::{Delay, Duration, Timer};
 use embedded_io_async::Write;
 use esp32_dht11_rs::{Reading, DHT11};
 use esp_hal::{
-    clock::{self, CpuClock},
-    gpio::{AnyPin, Flex, Input, InputConfig, Io, Level, Output, OutputConfig, Pin},
-    peripherals::{GPIO, GPIO3, I2C0},
-    timer::{systimer::SystemTimer, timg::TimerGroup},
+    analog::adc::{Adc, AdcConfig, AdcPin}, clock::{self, CpuClock}, gpio::{AnyPin, Level, Output, OutputConfig, Pin}, peripherals::{ADC1, GPIO4}, timer::{systimer::SystemTimer, timg::TimerGroup}, Async, DriverMode
 };
 use esp_wifi::{
     ble::controller::BleConnector,
@@ -77,7 +74,8 @@ macro_rules! mk_static {
     }};
 }
 
-type SensorChannel = Channel<NoopRawMutex, Reading, 1>;
+type DHTSensorChannel = Channel<NoopRawMutex, Reading, 1>;
+type LuxSensorChannel = Channel<NoopRawMutex, u16, 1>;
 
 #[esp_hal_embassy::main]
 async fn main(spawner: Spawner) {
@@ -122,8 +120,6 @@ async fn main(spawner: Spawner) {
         seed,
     );
 
-    let sensor_channel = &*mk_static!(SensorChannel, Channel::new());
-
     // TODO: Spawn some tasks
 
     spawner.spawn(connection(wifi_controller)).ok();
@@ -131,7 +127,6 @@ async fn main(spawner: Spawner) {
     // spawner.spawn(counter()).ok();
     info!("Run in background");
     info!("Starting MQTT task");
-
     while !sta_stack.is_link_up() {
         info!("=> Connecting...");
         Timer::after(Duration::from_millis(500)).await;
@@ -141,10 +136,17 @@ async fn main(spawner: Spawner) {
     let mut led = Output::new(peripherals.GPIO8, Level::High, OutputConfig::default());
     spawner.spawn(toggle(led)).ok();
     // DHT11 task
-    let mut dht_pin = peripherals.GPIO10.degrade();
-    spawner.spawn(dht_task(dht_pin, sensor_channel)).ok();
+    let dht_sensor_channel = &*mk_static!(DHTSensorChannel, Channel::new());
+    let mut dht_pin = peripherals.GPIO3.degrade();
+    spawner.spawn(dht_task(dht_pin, dht_sensor_channel)).ok();
+    // lux sensor task
+    let lux_sensor_channel = &*mk_static!(LuxSensorChannel, Channel::new());
+    let mut adc1_config = AdcConfig::new();
+    let pin = adc1_config.enable_pin(peripherals.GPIO4, esp_hal::analog::adc::Attenuation::_0dB);
+    let adc_1 = Adc::new(peripherals.ADC1, adc1_config).into_async();
+    spawner.spawn(lux_task(pin, adc_1, lux_sensor_channel)).ok();
     // MQTT task
-    spawner.spawn(mqtt_task(sta_stack, sensor_channel)).ok();
+    spawner.spawn(mqtt_task(sta_stack, dht_sensor_channel, lux_sensor_channel)).ok();
     // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.0.0-beta.1/examples/src/bin
 }
 
@@ -160,25 +162,25 @@ async fn connection(mut controller: WifiController<'static>) {
         });
         match controller.set_configuration(&client_config) {
             Ok(_) => info!("Set_configuration successful"),
-            Err(e) => info!("Set_configuration unsuccessful: {:?}", e),
+            Err(e) => warn!("Set_configuration unsuccessful: {:?}", e),
         };
         match controller.set_mode(esp_wifi::wifi::WifiMode::Sta) {
             Ok(_) => info!("Set_wifi_mode successful"),
-            Err(e) => info!("Set_wifi_mode unsuccessful: {:?}", e),
+            Err(e) => warn!("Set_wifi_mode unsuccessful: {:?}", e),
         }
         match controller.start_async().await {
             Ok(_) => info!("Start_wifi successful"),
-            Err(e) => info!("Start_wifi unsuccessful: {:?}", e),
+            Err(e) => warn!("Start_wifi unsuccessful: {:?}", e),
         }
 
         match controller.connect_async().await {
             Ok(_) => {
                 info!("Connection successful");
                 controller.wait_for_event(WifiEvent::StaDisconnected).await;
-                info!("Disconnected...");
+                warn!("Disconnected...");
             }
             Err(e) => {
-                info!("Connection unsuccessful: {:?}", e);
+                warn!("Connection unsuccessful: {:?}", e);
                 Timer::after(Duration::from_secs(1)).await;
             }
         }
@@ -209,7 +211,7 @@ async fn toggle(mut led: Output<'static>) {
 }
 
 #[embassy_executor::task]
-async fn mqtt_task(stack: Stack<'static>, sensor_channel: &'static SensorChannel) {
+async fn mqtt_task(stack: Stack<'static>, dht_sensor_channel: &'static DHTSensorChannel, lux_sensor_channel: &'static LuxSensorChannel) {
     let mut rx_buffer = [0u8; 1024];
     let mut tx_buffer = [0u8; 1024];
     let mut socket = tcp::TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
@@ -220,7 +222,7 @@ async fn mqtt_task(stack: Stack<'static>, sensor_channel: &'static SensorChannel
         MQTT_PORT.parse().expect("MQTT_PORT is not valid"),
     );
     while socket.connect(remote_endpoint).await.is_err() {
-        info!("Failed to connect to MQTT broker, retrying...");
+        warn!("Failed to connect to MQTT broker, retrying...");
         Timer::after(Duration::from_secs(1)).await;
     }
     socket.set_keep_alive(Some(Duration::from_secs(5)));
@@ -249,23 +251,23 @@ async fn mqtt_task(stack: Stack<'static>, sensor_channel: &'static SensorChannel
                         .receive_packet(response_slice, |mqtt_client, _topic, payload: &[u8]| {})
                     {
                         Ok(_) => info!("MQTT client connected successfully"),
-                        Err(e) => info!(
+                        Err(e) => warn!(
                             "Failed to connect MQTT client: {:?}",
                             format!("{:?}", e).as_str()
                         ),
                     }
                 }
                 Err(e) => {
-                    info!("Failed to read from socket: {:?}", e);
+                    warn!("Failed to read from socket: {:?}", e);
                     return;
                 }
             };
         }
-        Err(e) => info!("Err: {:?}", e),
+        Err(e) => warn!("Err: {:?}", e),
     }
     match socket.flush().await {
         Ok(_) => info!("Flushed---"),
-        Err(e) => info!("Err: {:?}", e),
+        Err(e) => warn!("Err: {:?}", e),
     };
     while !mqtt_client.is_connected() {
         info!("---> {}", socket.state());
@@ -275,31 +277,36 @@ async fn mqtt_task(stack: Stack<'static>, sensor_channel: &'static SensorChannel
     }
     loop {
         socket.wait_write_ready().await;
-        let payload = match sensor_channel.try_receive() {
+        let dht_data = match dht_sensor_channel.try_receive() {
             Ok(data) => {
-                format!(
-                    "{{\"sensor_id\": \"{}\", \"temperature\": \"{}\", \"humidity\": \"{}\"}}",
-                    MQTT_CLIENT_ID, data.temperature, data.humidity
-                )
+                let (temperature, humidity) = (data.temperature, data.humidity);
+                (temperature, humidity)
             }
             Err(_) => {
-                format!(
-                    "{{\"sensor_id\": \"{}\", \"temperature\": -1, \"humidity\": -1}}",
-                    MQTT_CLIENT_ID
-                )
+                let (temperature, humidity) = (0i8, 0u8);
+                warn!("DHT11 sensor data not available, using default values");
+                (temperature, humidity)
             }
         };
+        let lux_data = match lux_sensor_channel.try_receive() {
+            Ok(value) => value,
+            Err(_) => {
+                warn!("lux sensor data not available, using default value");
+                0u16
+            }
+        };
+        let payload = format!("{{\"sensor_id\": \"{}\", \"temperature\": {}, \"humidity\": {}, \"lux\": {}}}", MQTT_CLIENT_ID, dht_data.0, dht_data.1, lux_data);
         match mqtt_client.publish(MQTT_TOPIC, payload.as_bytes()) {
             Ok(packet) => match socket.write(packet).await {
                 Ok(size) => {
                     info!("Publish success with {} bytes", size);
                     socket.flush().await.unwrap();
                 }
-                Err(e) => info!("Err: {:?}", e),
+                Err(e) => warn!("Err: {:?}", e),
             },
             Err(e) => {
                 let err = format!("{:?}", e);
-                info!("Publishing error: {}", err.as_str())
+                warn!("Publishing error: {}", err.as_str())
             }
         }
         Timer::after(Duration::from_secs(1)).await;
@@ -307,18 +314,29 @@ async fn mqtt_task(stack: Stack<'static>, sensor_channel: &'static SensorChannel
 }
 
 #[embassy_executor::task]
-async fn dht_task(pin: AnyPin<'static>, sensor_channel: &'static SensorChannel) {
+async fn dht_task(pin: AnyPin<'static>, dht_sensor_channel: &'static DHTSensorChannel) {
     let mut dht = DHT11::new(pin);
     loop {
         critical_section::with(|_| match dht.read() {
             Ok(data) => {
-                sensor_channel.try_send(data).ok();
+                info!("DHT11 read: OK, Temperature: {}, Humidity: {}", data.temperature, data.humidity);
+                dht_sensor_channel.try_send(data).ok();
             }
             Err(error) => {
                 let err = format!("{:?}", error);
-                info!("DHT11 read error: {}", err.as_str());
+                warn!("DHT11 read error: {}", err.as_str());
             }
         });
+        Timer::after(Duration::from_secs(1)).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn lux_task(mut pin: AdcPin<GPIO4<'static>, ADC1<'static>>, mut adc: Adc<'static, ADC1<'static>, Async>, lux_sensor_channel: &'static LuxSensorChannel) {
+    loop {
+        let value = adc.read_oneshot(&mut pin).await;
+        info!("Light sensor read: OK {}", value);
+        lux_sensor_channel.try_send(value).ok();
         Timer::after(Duration::from_secs(1)).await;
     }
 }
